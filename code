@@ -1,0 +1,295 @@
+/*
+Controller programming code: Written on CPP modified to work on Arduino IDE
+Written for and by Electronics & Robotics Club, IIT Bombay with assistance from internet resources.
+
+For: ESP01-MPU circuit meant to act as motion based controller
+Uploading procedure will be done by convenors, special circuit required.
+
+This is esp01_controller.ino with the TCP client replaced by UDP, plus the
+RTC-memory channel/BSSID hint from Saravan's sketch so a dropped link comes
+back in well under a second instead of rescanning all 13 channels.
+
+©️ERC // MIT License 2024
+*/
+
+#include <ESP8266WiFi.h> // Library that has functions to help use WiFi to communicate
+#include <WiFiUdp.h>     // UDP transport - fire and forget, no handshake per packet
+#include <Wire.h>        // Library that helps communication between ESP01 and MPU6050
+#include <floatToString.h>
+
+const char* ssid     = "robocode123";    // SSID is your Raspberry Pi Pico W's WiFi's name!
+const char* password = "robocode";     // keep it secret, or people might try to interfere during your final run XD
+const int   MPU      = 0x68;           // I2C address of the MPU-6050 sensor (HW-123E / GY-521 breakout)
+const int   PORT     = 80;             // must match the Pico's listening port
+
+#define SEND_INTERVAL_MS 100           // 10 Hz, same cadence as the old TCP loop
+#define TX_POWER_DBM     20.5          // max TX power for ESP8266 (dBm)
+
+// Reconnect ladder. Each rung is more forceful than the last; the timer resets
+// on every success, so a healthy link never leaves rung 0.
+#define RUNG_SCAN_MS      1500         // hinted probe missed -> full scan
+#define RUNG_RADIO_MS     5000         // still nothing -> bounce the radio
+#define RUNG_REBOOT_MS   15000         // still nothing -> restart
+
+// Set to 1 ONLY if the Pico replies to each packet with a datagram starting
+// with 'A'. UDP has no delivery feedback, so without such a reply the ESP
+// cannot tell "associated but the Pico is dead" from a healthy link. With a
+// Pico that never answers, leaving this at 1 makes the watchdog below tear
+// down a perfectly good link every ACK_TIMEOUT_MS.
+#define EXPECT_ACK        0
+#define ACK_TIMEOUT_MS    8000         // associated, but the Pico is not answering
+
+float gyrox, gyroy, gyroz;
+char  gx[8], gy[8], gz[8];   // widened from [6] - "-10.24\0" needs 8 bytes, [6] could overflow
+char  packet[32];            // "-10.24, -10.24, -10.24\n\0" = 24 bytes
+
+WiFiUDP   udp;
+IPAddress host;              // the Pico's AP address, discovered at runtime
+uint32_t  lastAck = 0;
+
+// Filled in by the disconnect event handler. The reason code is the single most
+// useful thing when a link keeps dropping. volatile because the SDK calls this
+// from outside loop().
+volatile int lastDisconnectReason = 0;
+WiFiEventHandler onDisconnect;
+
+// ------------------------------------------------------------------ FAST RECONNECT
+// A cold WiFi.begin() scans all 13 channels: seconds before it even tries to
+// associate. Remembering the channel and BSSID turns that into a single-channel
+// probe. RTC memory survives ESP.restart(), so even a reboot comes back fast.
+struct LinkHint {
+  uint32_t magic;
+  uint32_t channel;
+  uint8_t  bssid[6];
+  uint8_t  pad[2];
+  uint32_t check;
+};
+
+#define HINT_MAGIC 0x45524332u
+LinkHint hint;
+bool hintValid = false;
+
+// NOTE: takes no arguments on purpose. The Arduino IDE injects auto-generated
+// prototypes above this struct, so a signature mentioning LinkHint would fail
+// to compile ("does not name a type").
+uint32_t hintCheck() {
+  uint32_t check = hint.magic ^ (hint.channel * 2654435761u);
+  for (int index = 0; index < 6; index++) {
+    check = check * 33u + hint.bssid[index];
+  }
+  return check;
+}
+
+void loadHint() {
+  hintValid = false;
+  if (!ESP.rtcUserMemoryRead(0, (uint32_t*)&hint, sizeof(hint))) return;
+  hintValid = hint.magic == HINT_MAGIC && hint.check == hintCheck() &&
+              hint.channel >= 1 && hint.channel <= 14;
+}
+
+void saveHint() {
+  hint.magic   = HINT_MAGIC;
+  hint.channel = WiFi.channel();
+  memcpy(hint.bssid, WiFi.BSSID(), 6);
+  hint.pad[0]  = 0;
+  hint.pad[1]  = 0;
+  hint.check   = hintCheck();
+  ESP.rtcUserMemoryWrite(0, (uint32_t*)&hint, sizeof(hint));
+  hintValid = true;
+}
+
+// ------------------------------------------------------------------ IMU READ
+
+// Returns true if a full, valid reading was retrieved, false if the MPU
+// did not answer (wiring/address/power issue) - lets us skip sending junk.
+bool readIMUData() {
+  Wire.beginTransmission(MPU);
+  Wire.write(0x3B); // Register address to start reading from
+  if (Wire.endTransmission(false) != 0) return false;  // MPU did not ACK
+
+  uint8_t received = Wire.requestFrom((uint8_t)MPU, (size_t)14, true);
+  if (received < 14) return false;   // fewer bytes than expected came back
+
+  int16_t rawValues[7];
+  for (int index = 0; index < 7; index++) {
+    rawValues[index] = Wire.read() << 8 | Wire.read();
+  }
+
+  gyrox = rawValues[0] / 16384.0 * 10;
+  gyroy = rawValues[1] / 16384.0 * 10;
+  gyroz = rawValues[2] / 16384.0 * 10;
+  floatToString(gyrox, gx, sizeof(gx) - 1, 2);
+  floatToString(gyroy, gy, sizeof(gy) - 1, 2);
+  floatToString(gyroz, gz, sizeof(gz) - 1, 2);
+  return true;
+}
+
+// ------------------------------------------------------------------ WIFI
+
+enum { RUNG_FAST, RUNG_SCAN, RUNG_RADIO };
+uint32_t rungSince = 0;
+uint8_t  rung = RUNG_FAST;
+
+void beginWiFi(bool useHint) {
+  if (useHint && hintValid) {
+    WiFi.begin(ssid, password, (int32_t)hint.channel, hint.bssid, true);
+  } else {
+    WiFi.begin(ssid, password);
+  }
+}
+
+void startWiFi() {
+  WiFi.persistent(false);                  // never write credentials to flash
+  WiFi.mode(WIFI_STA);                     // explicit; avoids leftover AP mode from a prior sketch
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);      // modem sleep adds 100ms+ of jitter
+  WiFi.setPhyMode(WIFI_PHY_MODE_11G);
+  WiFi.setOutputPower(TX_POWER_DBM);
+
+  // We drive reconnection ourselves. Leaving the SDK's auto-reconnect on as
+  // well means two state machines calling begin()/disconnect() at the same
+  // time, which produces exactly the flapping it is meant to prevent.
+  WiFi.setAutoReconnect(false);
+
+  onDisconnect = WiFi.onStationModeDisconnected(
+      [](const WiFiEventStationModeDisconnected& event) {
+        lastDisconnectReason = (int)event.reason;
+      });
+
+  loadHint();
+  beginWiFi(true);
+  rungSince = millis();
+  rung = RUNG_FAST;
+}
+
+bool wifiReady() {
+  static bool wasUp = false;
+  static uint32_t downSince = 0;
+
+  if (!downSince) downSince = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wasUp) {
+      wasUp = true;
+      host = WiFi.gatewayIP();             // the AP we joined IS the Pico
+      udp.begin(PORT + 1);                 // local port the Pico's replies land on
+      saveHint();
+      lastAck = millis();
+      Serial.printf("LINK up in %lums  ch%d  rssi %d  me=%s bot=%s\n",
+                    (unsigned long)(millis() - downSince), WiFi.channel(), WiFi.RSSI(),
+                    WiFi.localIP().toString().c_str(), host.toString().c_str());
+      // ^ no hardcoded IP anywhere - the Pico is, by definition, our gateway
+      //   since it's the access point we joined.
+    }
+    rungSince = millis();
+    rung = RUNG_FAST;
+    return true;
+  }
+
+  if (wasUp) {
+    wasUp = false;
+    downSince = millis();
+    Serial.printf("LINK lost (reason %d) - reconnecting now\n", lastDisconnectReason);
+    // Do not wait for a timer to expire. Fire the hinted probe immediately.
+    // This is what turns a ~10s recovery into well under a second.
+    beginWiFi(true);
+    rungSince = millis();
+    rung = RUNG_FAST;
+    return false;
+  }
+
+  uint32_t disconnectedFor = millis() - rungSince;
+  if (rung == RUNG_FAST && disconnectedFor > RUNG_SCAN_MS) {
+    rung = RUNG_SCAN;
+    Serial.println(F("[wifi] full scan"));
+    WiFi.disconnect(false);
+    beginWiFi(false);
+  } else if (rung == RUNG_SCAN && disconnectedFor > RUNG_RADIO_MS) {
+    rung = RUNG_RADIO;
+    Serial.println(F("[wifi] radio reset"));
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(120);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+    WiFi.setPhyMode(WIFI_PHY_MODE_11G);
+    WiFi.setOutputPower(TX_POWER_DBM);
+    beginWiFi(false);
+  } else if (rung == RUNG_RADIO && disconnectedFor > RUNG_REBOOT_MS) {
+    Serial.println(F("[wifi] reboot"));
+    Serial.flush();
+    ESP.restart();                         // hint survives in RTC memory
+  }
+  return false;
+}
+
+// ------------------------------------------------------------------ SETUP
+
+void setup() {
+  Serial.begin(115200);
+  delay(150);
+
+  Wire.begin(0, 2); // SDA = GPIO0, SCL = GPIO2 (ESP-01 hack)
+  Wire.beginTransmission(MPU);
+  Wire.write(0x6B); // Power management register address
+  Wire.write(0);    // Wake up the MPU-6050
+  Wire.endTransmission(true);
+  delay(10);
+
+  Serial.print(F("\nConnecting to "));
+  Serial.println(ssid);
+  startWiFi();
+}
+
+// ------------------------------------------------------------------ LOOP
+
+void loop() {
+  static uint32_t lastSend = 0;
+
+  // Drain replies. The Pico answering proves the whole path works, not just the
+  // 802.11 association. Always drained even when EXPECT_ACK is 0, otherwise
+  // incoming datagrams pile up in the lwIP buffers.
+  while (udp.parsePacket() > 0) {
+    char ack[8];
+    int received = udp.read(ack, sizeof(ack) - 1);
+    if (received > 0) {
+      ack[received] = 0;
+      if (ack[0] == 'A') lastAck = millis();
+    }
+  }
+
+  bool linked = wifiReady();
+
+#if EXPECT_ACK
+  // Deliberately forgiving, and the recovery is a cheap hinted re-begin rather
+  // than a teardown. An over-eager version of this check will itself drop a
+  // perfectly good link every few seconds when a handful of acks go missing.
+  if (linked && millis() - lastAck > ACK_TIMEOUT_MS) {
+    Serial.println(F("[wifi] no acks - re-associating"));
+    lastAck = millis();
+    beginWiFi(true);
+  }
+#endif
+
+  if (!linked) return;
+  if (millis() - lastSend < SEND_INTERVAL_MS) return;
+  lastSend = millis();
+
+  // Read the IMU once per send, not once per loop pass - the I2C transaction
+  // is the slowest thing here and there is nobody to consume the extra samples.
+  if (!readIMUData()) {
+    Serial.println(F("MPU6050 not responding - check wiring/address"));
+    return;   // don't send junk data
+  }
+
+  Serial.println(gx);
+  Serial.println(gy);
+  Serial.println(gz);
+
+  int length = snprintf(packet, sizeof(packet), "%s, %s, %s\n", gx, gy, gz);
+  if (length <= 0) return;
+  if (length >= (int)sizeof(packet)) length = sizeof(packet) - 1;
+
+  udp.beginPacket(host, PORT);
+  udp.write((const uint8_t*)packet, length);
+  udp.endPacket();
+}
